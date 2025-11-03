@@ -1,0 +1,9 @@
+s3-to-speakers:
+    python3.9 serial_to_stdout.py | \
+    ffplay -nodisp -autoexit -f s16le -ar 16000 -af "atrim=start=0.5,asetpts=N/SR/TB,highpass=f=300" -
+
+s3-record:
+    python3.9 serial_to_stdout.py \
+    | ffmpeg -y -f s16le -ar 16000 -ac 1 -i - \
+    -af "atrim=start=0.5,asetpts=N/SR/TB" \
+    -c:a pcm_s16le mic.wav
