@@ -1,6 +1,6 @@
 import serial, sys
 
-PORT = "/dev/cu.usbmodem1101"  # adjust if needed
+PORT = "/dev/cu.usbmodem2101"  # adjust if needed
 BAUD = 921600
 
 ser = serial.Serial(PORT, BAUD)
