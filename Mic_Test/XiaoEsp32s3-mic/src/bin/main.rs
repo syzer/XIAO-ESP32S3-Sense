@@ -1,130 +1,82 @@
 #![no_std]
 #![no_main]
-#![deny(
-    clippy::mem_forget,
-    reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
-    holding buffers for the duration of a data transfer."
-)]
 
-use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
-use esp_backtrace as _;
-use esp_hal::clock::CpuClock;
-use esp_hal::timer::timg::TimerGroup;
-use esp_println::{println, print};
-
-// Inline microphone scaffold module (avoids separate bin confusion)
-mod mic {
-    use core::cell::Cell;
-
-    pub const SAMPLE_RATE_HZ: u32 = 16_000;
-    pub const FRAME_SAMPLES: usize = 1024; // matches Arduino example buffer length
-
-    #[derive(Copy, Clone, Debug)]
-    pub enum SlotSelect {
-        Left,
-        Right,
-    }
-
-    pub struct MicPdm {
-        slot: SlotSelect,
-        synth_phase: Cell<i16>,
-    }
-
-    impl MicPdm {
-        pub fn new(slot: SlotSelect) -> Self {
-            Self { slot, synth_phase: Cell::new(0) }
-        }
-
-        pub fn init(&self) -> Result<(), &'static str> {
-            // TODO: hardware register configuration for PDM RX
-            Ok(())
-        }
-
-        pub fn read_frame(&self, out: &mut [i16]) -> usize {
-            let mut phase = self.synth_phase.get();
-            for s in out.iter_mut() {
-                phase = phase.wrapping_add(173);
-                *s = phase;
-            }
-            self.synth_phase.set(phase);
-            out.len() * core::mem::size_of::<i16>()
-        }
-
-        pub fn slot(&self) -> SlotSelect { self.slot }
-    }
-
-}
-use mic::{MicPdm, FRAME_SAMPLES, SlotSelect};
-
-extern crate alloc;
-
-// This creates a default app-descriptor required by the esp-idf bootloader.
-// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[esp_rtos::main]
-async fn main(spawner: Spawner) -> ! {
-    // generator version: 1.0.0
-    println!("🎤 Starting XIAO ESP32S3 Microphone Test");
-    println!("📋 Initializing system configuration...");
-    
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    println!("⚡ CPU Clock set to maximum frequency");
-    
-    let peripherals = esp_hal::init(config);
-    println!("🔌 Hardware peripherals initialized");
+use esp_backtrace as _;
+use esp_hal::{
+    init,
+    gpio::{Output, Level, OutputConfig},
+};
+use esp32s3 as pac;
+use embedded_hal::delay::DelayNs;
 
-    esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 73744);
-    println!("💾 Heap allocator configured (73744 bytes)");
+#[esp_hal::main]
+fn main() -> ! {
+    // Initialize base HAL peripherals
+    let peripherals = init(esp_hal::Config::default());
 
-    println!("⏰ Initializing timer group...");
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(timg0.timer0);
-    println!("✅ Timer initialized and started");
+    // --- Enable I2S0 peripheral clock and clear reset ---
+    let sys = unsafe { &*pac::SYSTEM::ptr() };
+    sys.perip_clk_en0().modify(|_, w| w.i2s0_clk_en().set_bit());
+    sys.perip_rst_en0().modify(|_, w| w.i2s0_rst().clear_bit());
 
-    println!("📡 Initializing Wi-Fi/BLE controller...");
-    let radio_init = esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller");
-    println!("📶 Radio initialization complete");
-    
-    let (mut _wifi_controller, _interfaces) =
-        esp_radio::wifi::new(&radio_init, peripherals.WIFI, Default::default())
-            .expect("Failed to initialize Wi-Fi controller");
-    println!("🌐 Wi-Fi controller initialized");
+    // --- Get direct register block for I2S0 ---
+    let i2s = unsafe { &*pac::I2S0::ptr() };
 
-    println!("🚀 System initialization complete!");
-    println!("� Setting up PDM microphone scaffold (Option B)...");
-    let mic = MicPdm::new(SlotSelect::Right); // try Right first, same as Arduino
-    mic.init().expect("Mic init stub failed");
-    println!("✅ Mic scaffold ready (synthetic data until registers added)");
+    // TODO: Fix I2S register access - these methods don't exist in the PAC
+    // Need to check actual register structure
+    // --- Reset internal I2S state ---
+    // i2s.conf().modify(|_, w| w.rx_reset().set_bit().tx_reset().set_bit());
+    // i2s.conf().modify(|_, w| w.rx_reset().clear_bit().tx_reset().clear_bit());
 
-    // Working buffer for one frame
-    let mut frame = [0i16; FRAME_SAMPLES];
-    let mut frames = 0u32;
-    let start = embassy_time::Instant::now();
-    println!("🎬 Capturing synthetic frames. (Replace with real PDM soon)");
+    // --- Configure RX clocking ---
+    // 16 kHz × 64 = ~1.024 MHz PDM clock target
+    // i2s.clkm_conf().modify(|_, w| {
+    //     w.clka_en().set_bit();
+    //     w.clkm_div_a().bits(0);
+    //     w.clkm_div_b().bits(0);
+    //     w.clkm_div_num().bits(1)
+    // });
+
+    // --- Configure RX for PDM → PCM ---
+    // Based on reference: clear TDM, set PDM
+    i2s.rx_conf().modify(|_, w| {
+        w.rx_tdm_en().clear_bit()
+         .rx_pdm_en().set_bit()   // enable PDM front-end
+         .rx_mono().set_bit()     // mono mode
+    });
+
+    // TODO: Check correct field name for PDM2PCM enable
+    // i2s.rx_conf1().modify(|_, w| {
+    //     w.rx_pdm2pcm_en().set_bit() // enable sinc filter
+    // });
+
+    // TODO: Fix these register accesses
+    // --- Set PDM decimation (downsample ratio = 64) ---
+    // NOTE: Field name might differ by PAC version — check docs if this fails
+    // if let Some(reg) = i2s.rx_pdm_conf.as_ref() {
+    //     reg.modify(|_, w| unsafe {
+    //         w.rx_sinc_osr2().bits(64); // try 64x downsample
+    //         w
+    //     });
+    // }
+
+    // --- Select RIGHT channel (like Arduino example) ---
+    // i2s.rx_tdm_ctrl().modify(|_, w| unsafe {
+    //     w.rx_total_chan_num().bits(1);
+    //     w.rx_chan_bits().bits(16);
+    //     w
+    // });
+
+    // --- Enable RX ---
+    // i2s.conf().modify(|_, w| w.rx_start().set_bit());
+
+    // --- Simple LED blink loop to show life ---
+    let mut led = Output::new(peripherals.GPIO21, Level::Low, OutputConfig::default());
+
     loop {
-        let bytes = mic.read_frame(&mut frame);
-        frames += 1;
-
-        // Print every Nth sample to keep output light (decimate)
-        if frames % 20 == 0 { // roughly every 20 frames
-            print!("frame {} ", frames);
-            for i in (0..FRAME_SAMPLES).step_by(128) { // sparse samples
-                print!("{} ", frame[i]);
-            }
-            println!("");
-        }
-
-        // Sleep a bit to simulate pacing as if waiting on DMA read
-        Timer::after(Duration::from_millis(10)).await;
-
-        // Exit after ~20s to satisfy quick test expectation (can remove later)
-        if start.elapsed() > Duration::from_secs(20) {
-            println!("⏱️ 20s capture window complete. Total frames: {}", frames);
-            loop { /* halt */ }
-        }
+        led.toggle();
+        esp_hal::delay::Delay::new().delay_ms(500u32);
     }
-
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0/examples/src/bin
 }

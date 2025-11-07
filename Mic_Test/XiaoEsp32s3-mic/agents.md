@@ -1,13 +1,24 @@
 # Agent Verification Procedure
 
 Every development step should be validated the same way: run the firmware for a short, bounded window and inspect the output.
+Remember that is esp32s3 xiao sense board, so the serial port is on the USB-C port.
 
 ## Quick Check Command
-Use a 20‑second timeout:
+Use a 30‑second timeout:
 
 ```fish
-timeout 20s cargo run
+export PATH="$HOME/.cargo/bin:$PATH" && export RUSTUP_TOOLCHAIN=esp && source ~/export-esp.sh && unbuffer timeout 30s cargo run --bin xiao_esp32s3_mic
 ```
+
+## Initial Check
+if 
+```
+Error:   × Failed to open serial port /dev/cu.usbmodem2101
+  ╰─▶ Error while connecting to device
+```
+run one liner to kill all processes blocking port
+```
+kill -9 $(lsof -t /dev/cu.usb* 2>/dev/null)
 
 ## What This Does
 - Builds the current code.
