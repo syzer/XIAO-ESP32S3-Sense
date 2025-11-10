@@ -1,50 +1,46 @@
-# Project TODO
+🎚️ 2. Reset I2S0 before touching registers
 
-This file lists actionable steps to replace the synthetic microphone scaffold with a working PDM I2S receiver for the XIAO ESP32S3 Sense.
+🕓 3. Configure clocks
 
-Guiding principle: validate each change with a short run:
+The PDM input clock must be ≈ 1 MHz (16 kHz × 64).
+Example:
+i2s.clkm_conf().modify(|_, w| {
+    w.clka_en().set_bit();
+    w.clkm_div_a().bits(0);
+    w.clkm_div_b().bits(0);
+    w.clkm_div_num().bits(1)
+});
 
-```fish
-timeout 20s cargo run
-```
+🎤 4. Enable PDM → PCM mode
+i2s.rx_conf().modify(|_, w| {
+    w.rx_tdm_en().clear_bit();
+    w.rx_pdm_en().set_bit();     // Enable PDM front-end
+    w.rx_mono().set_bit();       // Mono mode
+    w
+});
+i2s.rx_conf1().modify(|_, w| w.rx_pdm2pcm_en().set_bit());
 
-## High priority
+🔢 5. Set decimation ratio (SINC downsample)
+In the PAC it’s normally under rx_pdm_conf():
+i2s.rx_pdm_conf().modify(|_, w| unsafe {
+    w.rx_sinc_osr2().bits(64);   // 64× decimation
+    w
+});
 
-- [ ] Implement I2S0 PDM RX initialization (low-level registers or PAC)
-  - Configure pin matrix: CLK = GPIO42, DIN = GPIO41
-  - Set PDM/I2S clock dividers to produce 16 kHz sampling (target 16_000 Hz)
-  - Configure data format: 16-bit, mono, RIGHT slot mask (match Arduino sketch)
-  - Configure PDM decimation/filter registers (PDM_RX configuration)
-  - Configure DMA / descriptors (e.g. 8 descriptors, frame size 256 or ring of 1024 samples)
-  - Start channel and enable interrupts or DMA completion
+🎧 6. Configure slot and channel width
+i2s.rx_tdm_ctrl().modify(|_, w| unsafe {
+    w.rx_total_chan_num().bits(1);
+    w.rx_chan_bits().bits(16);
+    w
+});
 
-- [ ] Replace synthetic generator with real DMA or FIFO reads into `frame: [i16; 1024]`
-  - Provide a `read_frame()` that returns number of bytes filled
-  - Keep decimated debug printing until verified
-
-- [ ] Basic capture test
-  - Run `timeout 20s cargo run`
-  - Expect serial output lines like `frame <n> <samples...>` within the window
-  - If silence: flip slot mask to LEFT and retry
-
-## Medium priority
-
-- [ ] Add a binary/raw-mode serial option that writes S16LE PCM directly (for use with Python/ffmpeg)
-- [ ] Support WAV framing or a small header when dumping to serial
-- [ ] Improve buffering: double-buffer or lock-free ring with DMA callbacks
-
-## Cleanups & docs
-
-- [ ] Move inline `mic` module into `src/mic.rs` (shared lib) once init is stable
-- [ ] Add `README.md` with run instructions and expected output format (pinout, sample rate, slot)
-- [x] Keep `agents.md` for the agent verification procedure (20s checks)
-
-## Follow-ups
-
-- Investigate using `esp-idf` I2S PDM driver via `esp-idf-sys` or `esp-idf-hal` if low-level work becomes brittle.
-- Add unit/integration tests for sample handling code.
+▶️ 7. Start RX
+i2s.conf().modify(|_, w| w.rx_start().set_bit());
 
 
----
+🔍 8. Verify
+	Scope GPIO42: ~1 MHz square wave = OK.
+	•	Scope GPIO41: noisy PDM waveform = mic output present.
 
-If you want, I can start on the first high-priority item now and wire the concrete register sequence for PDM RX on the ESP32-S3.
+If both signals look good → the hardware side is alive.
+Then, to capture PCM, read the RX FIFO or attach DMA later.
