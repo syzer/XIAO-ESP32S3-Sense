@@ -13,16 +13,20 @@ use esp_hal::{
     usb_serial_jtag::UsbSerialJtag,
 };
 use esp32s3 as pac;
-use esp_println::{println, print};
 use esp_hal::Blocking;
-use libm::sqrtf;
+use esp_println::println;
+use nb;
 
 const SAMPLE_RATE: u32 = 16_000;
 const SAMPLE_SIZE: usize = 2; // 16-bit samples = 2 bytes
-const SAMPLES_PER_BUFFER: usize = 512; // 512 samples per buffer (matching IDF)
+const SAMPLES_PER_BUFFER: usize = 512; // 512 samples per buffer
 const BUFFER_SIZE: usize = SAMPLES_PER_BUFFER * SAMPLE_SIZE; // 1024 bytes
-const GAIN_SHIFT: u8 = 0; // no attenuation, hardware output is already quiet
-const GAIN_BOOST: i16 = 32; // post-filter gain multiplier (approx +30 dB)
+const GAIN_SHIFT: u8 = 0;
+const GAIN_BOOST: i16 = 40;
+const WARMUP_FRAMES: u32 = (SAMPLE_RATE / SAMPLES_PER_BUFFER as u32) * 2 + 32; // ~2s + margin
+const DIAG_INTERVAL: u32 = 500; // how often to print diagnostics
+const DROPPED_WARN_THRESHOLD: u32 = 1;
+const MAX_USB_WRITE_SPINS: u32 = 10_000;
 
 #[esp_hal::main]
 fn main() -> ! {
@@ -78,7 +82,8 @@ fn main() -> ! {
     regs.rx_conf().modify(|_, w| {
         w.rx_tdm_en().clear_bit()
             .rx_pdm_en().set_bit()
-            .rx_mono().clear_bit()
+            .rx_mono().set_bit()
+            .rx_mono_fst_vld().clear_bit() // use RIGHT slot
             .rx_pdm2pcm_en().set_bit()
             .rx_pdm_sinc_dsr_16_en().clear_bit()
     });
@@ -104,23 +109,20 @@ fn main() -> ! {
     // LED heartbeat (GPIO21)
     let mut led = Output::new(peripherals.GPIO21, Level::Low, OutputConfig::default());
     let mut frames = 0u32;
-    let mut _errors = 0u32;
-
-    // Prime host with zeros to reduce latency
-    let prime = [0u8; BUFFER_SIZE];
-    for _ in 0..32 {
-        let _ = usb.write(&prime);
-    }
+    let mut errors = 0u32;
+    let mut dropped_frames = 0u32;
+    let mut last_reported_dropped = 0u32;
 
     let mut buffer = [0u8; BUFFER_SIZE];
-    let mut skip_frames = 32u8;
+    let mut warmup_frames = WARMUP_FRAMES;
     let mut dc_acc: i32 = 0;
+    let mut diag_counter = 0u32;
 
     loop {
         let avail = match rx_xfer.available() {
             Ok(v) => v,
             Err(_) => {
-                _errors = _errors.wrapping_add(1);
+                errors = errors.wrapping_add(1);
                 continue;
             }
         };
@@ -133,7 +135,7 @@ fn main() -> ! {
         let read_bytes = match rx_xfer.pop(&mut buffer[..chunk]) {
             Ok(n) => n,
             Err(_) => {
-                _errors = _errors.wrapping_add(1);
+                errors = errors.wrapping_add(1);
                 continue;
             }
         };
@@ -143,6 +145,15 @@ fn main() -> ! {
         }
 
         let mut idx = 0;
+        let mut total_abs: i64 = 0;
+        let mut even_abs: i64 = 0;
+        let mut odd_abs: i64 = 0;
+        let mut even_count: i64 = 0;
+        let mut odd_count: i64 = 0;
+        let mut zero_crossings: u32 = 0;
+        let mut prev_sign: i8 = 0;
+        let mut sample_idx: i64 = 0;
+
         while idx + 1 < read_bytes {
             let mut sample = i16::from_le_bytes([buffer[idx], buffer[idx + 1]]);
             if GAIN_SHIFT > 0 {
@@ -154,22 +165,112 @@ fn main() -> ! {
 
             sample = sample.saturating_mul(GAIN_BOOST);
 
+            let abs = sample.wrapping_abs() as i64;
+            total_abs += abs;
+            if sample_idx % 2 == 0 {
+                even_abs += abs;
+                even_count += 1;
+            } else {
+                odd_abs += abs;
+                odd_count += 1;
+            }
+
+            let sign = if sample > 0 { 1 } else if sample < 0 { -1 } else { 0 };
+            if sign != 0 && prev_sign != 0 && sign != prev_sign {
+                zero_crossings = zero_crossings.saturating_add(1);
+            }
+            if sign != 0 {
+                prev_sign = sign;
+            }
+
             let bytes = sample.to_le_bytes();
             buffer[idx] = bytes[0];
             buffer[idx + 1] = bytes[1];
             idx += 2;
+            sample_idx += 1;
         }
 
-        if skip_frames > 0 {
-            skip_frames -= 1;
-            continue;
+        diag_counter = diag_counter.wrapping_add(1);
+        if diag_counter >= DIAG_INTERVAL {
+            let sample_count = if sample_idx > 0 { sample_idx } else { 1 };
+            let total_avg = total_abs / sample_count;
+            let even_avg = if even_count > 0 { even_abs / even_count } else { 0 };
+            let odd_avg = if odd_count > 0 { odd_abs / odd_count } else { 0 };
+            let zero_ratio = zero_crossings as f32 / sample_count as f32;
+
+            let classification = if total_avg < 50 {
+                "silence"
+            } else if even_avg < 50 && odd_avg > 200 {
+                "channel-mismatch (chipmunk?)"
+            } else if zero_ratio > 0.6 {
+                "high zero-cross (noise?)"
+            } else {
+                "speech-like"
+            };
+            // println!(
+            //     "diag avg:{} even:{} odd:{} zero_ratio:{:.2} => {}",
+            //     total_avg, even_avg, odd_avg, zero_ratio, classification
+            // );
+            diag_counter = 0;
         }
 
-        let _ = usb.write(&buffer[..read_bytes]);
+        if warmup_frames > 0 {
+            warmup_frames -= 1;
+        } else {
+            let mut sent_all = true;
+            let mut out_idx = 0;
+            while out_idx < read_bytes {
+                let mut spins = 0;
+                loop {
+                    match usb.write_byte_nb(buffer[out_idx]) {
+                        Ok(()) => {
+                            out_idx += 1;
+                            break;
+                        }
+                        Err(nb::Error::WouldBlock) => {
+                            spins += 1;
+                            core::hint::spin_loop();
+                            if spins >= MAX_USB_WRITE_SPINS {
+                                sent_all = false;
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            sent_all = false;
+                            errors = errors.wrapping_add(1);
+                            break;
+                        }
+                    }
+                }
+                if !sent_all {
+                    break;
+                }
+            }
 
-        // frames = frames.wrapping_add(1);
-        // if frames % 100 == 0 {
-        //     led.toggle();
-        // }
+            if !sent_all {
+                dropped_frames = dropped_frames.wrapping_add(1);
+            }
+        }
+
+        frames = frames.wrapping_add(1);
+        if frames % 100 == 0 {
+            led.toggle();
+        }
+
+        if frames % DIAG_INTERVAL == 0 {
+            // println!(
+            //     "frames:{} errors:{} dropped:{}",
+            //     frames, errors, dropped_frames
+            // );
+            if dropped_frames > last_reported_dropped
+                && dropped_frames - last_reported_dropped >= DROPPED_WARN_THRESHOLD
+            {
+                // println!(
+                //     "warning: dropped {} frame(s) since last check",
+                //     dropped_frames - last_reported_dropped
+                // );
+            }
+            last_reported_dropped = dropped_frames;
+        }
     }
 }
