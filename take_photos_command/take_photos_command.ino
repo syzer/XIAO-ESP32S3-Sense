@@ -141,6 +141,7 @@ void setup() {
 
 void loop() {
   // Camera & SD available, start taking pictures
+  // REMEMBER  TO TURN ON SERIAL CARRIAGE RETURN IN MENU COMMAND
   if(camera_sign && sd_sign){
       String command;
       // Read incoming commands from serial monitor
