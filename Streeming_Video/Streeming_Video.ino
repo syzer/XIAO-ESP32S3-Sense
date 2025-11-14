@@ -22,9 +22,10 @@
 #include "soc/rtc_cntl_reg.h"  //disable brownout problems
 #include "esp_http_server.h"
 
+#include "wifi_credentials.h"
 //Replace with your network credentials
-const char* ssid = "Your credentials here";
-const char* password = "Your credentials here";
+// const char* ssid = "Your credentials here";
+// const char* password = "Your credentials here";
 
 #define PART_BOUNDARY "123456789000000000000987654321"
 
@@ -156,7 +157,7 @@ void setup() {
     return;
   }
   // Wi-Fi connection
-  WiFi.begin(ssid, password);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
