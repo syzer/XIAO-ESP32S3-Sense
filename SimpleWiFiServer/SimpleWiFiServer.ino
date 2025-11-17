@@ -21,9 +21,10 @@
  */
 
 #include <WiFi.h>
+#include "wifi_credentials.h"
 
-const char* ssid     = "Your credentials here";
-const char* password = "Your credentials here";
+// const char* ssid     = "Your credentials here";
+// const char* password = "Your credentials here";
 
 WiFiServer server(80);
 
@@ -40,9 +41,9 @@ void setup()
     Serial.println();
     Serial.println();
     Serial.print("Connecting to ");
-    Serial.println(ssid);
+    Serial.println(WIFI_SSID);
 
-    WiFi.begin(ssid, password);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);

@@ -167,19 +167,40 @@ void setup() {
   config.pin_sscb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  // config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 24000000;
   config.frame_size   = FRAMESIZE_VGA;
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location  = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 15;
-  config.fb_count     = 1;
+  config.jpeg_quality = 20;
+  config.fb_count     = 2;
+  config.grab_mode    = CAMERA_GRAB_LATEST;    // drop old frames
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed 0x%x\n", err);
     while (true) { delay(1000); }
   }
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) { // not required but make it brighter 
+    s->set_vflip(s, 1);   // vertical flip  (top ↔ bottom)
+
+    // Basic brightness: range -2 .. 2
+    s->set_brightness(s, 2);      // 2 = brighter
+
+    // A bit more saturation/contrast if you want
+    // s->set_contrast(s, 1);        // -2..2 // can make it apear green
+    // s->set_saturation(s, 1);      // -2..2
+
+    // Make sure auto exposure / auto gain are on
+    // s->set_exposure_ctrl(s, 1);   // 1 = auto
+    // s->set_gain_ctrl(s, 1);       // 1 = auto
+
+    // Allow higher analog gain if needed
+    // s->set_gainceiling(s, (gainceiling_t)2); // GAINCEILING_4X  // can make it apear green
+}
 
   Serial.println("Camera OK");
 
